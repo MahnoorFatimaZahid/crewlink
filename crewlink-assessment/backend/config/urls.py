@@ -3,7 +3,7 @@ from django.urls import include, path
 from rest_framework.routers import SimpleRouter
 
 from announcements.views import AnnouncementViewSet, InboxViewSet
-from core.views import LoginView, MeView
+from core.views import ClassificationListView, LoginView, MeView
 
 
 def health(request):
@@ -21,5 +21,6 @@ urlpatterns = [
     path("health/", health),
     path("api/auth/login", LoginView.as_view(), name="login"),
     path("api/me", MeView.as_view(), name="me"),
+    path("api/classifications", ClassificationListView.as_view(), name="classifications"),
     path("api/", include(router.urls)),
 ]

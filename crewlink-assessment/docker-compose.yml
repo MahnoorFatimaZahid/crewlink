@@ -1,4 +1,5 @@
-# docker compose up --build   ->  API on http://localhost:8000
+# docker compose up --build   ->  leadership screen on http://localhost:3000
+#                                 API on http://localhost:8000
 services:
   db:
     image: postgres:16
@@ -30,7 +31,11 @@ services:
 
   api:
     build: ./backend
-    env_file: .env.docker
+    # .env is optional and git-ignored: put GEMINI_API_KEY there to use real Gemini.
+    # Without it, the API uses the fake AI provider.
+    env_file:
+      - .env.docker
+      - {path: .env, required: false}
     ports: ["8000:8000"]
     depends_on:
       setup: {condition: service_completed_successfully}
@@ -55,6 +60,16 @@ services:
     depends_on:
       setup: {condition: service_completed_successfully}
       redis: {condition: service_healthy}
+
+  # Leadership screen. The browser talks only to this server; /api/* is proxied
+  # to the api service inside the compose network (no CORS needed).
+  web:
+    build:
+      context: ./frontend
+      args: {API_URL: "http://api:8000"}
+    ports: ["3000:3000"]
+    depends_on:
+      api: {condition: service_started}
 
 volumes:
   pgdata:
