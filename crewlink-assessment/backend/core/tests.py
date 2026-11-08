@@ -31,6 +31,25 @@ class AccountRulesTests(TestCase):
         with self.assertRaises(ValidationError):
             Account.objects.create(user=user, local=self.l27, role="member", member=self.m12)
 
+    def test_cross_local_member_login_refused_by_db_on_insert(self):
+        # bulk_create skips clean(), so only the composite FK can stop this.
+        user = User.objects.create_user("u", password="x")
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Account.objects.bulk_create(
+                [Account(user=user, local=self.l27, role="member", member=self.m12)])
+
+    def test_cross_local_member_login_refused_by_db_on_update(self):
+        # A valid account, then a queryset .update() moves it to another local.
+        user = User.objects.create_user("u", password="x")
+        acct = Account.objects.create(user=user, local=self.l12, role="member", member=self.m12)
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Account.objects.filter(pk=acct.pk).update(local=self.l27)
+
+    def test_leader_without_member_is_unaffected_by_composite_fk(self):
+        user = User.objects.create_user("u", password="x")
+        Account.objects.bulk_create([Account(user=user, local=self.l27, role="leader")])
+        self.assertTrue(Account.objects.filter(user=user, member__isnull=True).exists())
+
 
 class SeedTests(TestCase):
     def run_seed(self):

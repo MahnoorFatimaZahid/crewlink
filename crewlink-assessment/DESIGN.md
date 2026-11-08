@@ -56,7 +56,7 @@ When leadership sends a callout, every active member of that local (or just one 
 
 **Why timestamps, not one status field:** they keep *when* things happened, so "hasn't seen it" (`read_at` empty) and "seen, no reply" (`read_at` set, `rsvp` empty) fall straight out of the data. Acking sets `read_at` if it's empty. A repeat ack keeps the first time. RSVP can change until `event_at`. A read after expiry is still recorded.
 
-**Hardening (not built):** a composite foreign key on `(announcement_id, local_id)` would let Postgres itself guarantee a recipient row can never point at another local's callout.
+**Cross-local guarantee (built):** composite foreign keys make Postgres itself refuse a recipient row whose local differs from its announcement's `(announcement_id, local_id)` or its member's `(member_id, local_id)`, and an account whose `(member_id, local_id)` points at another local's member. They're raw SQL in migrations because Django can't express composite FKs; `Account.clean()` stays only for a friendly error message.
 
 ### 2. The send path
 

@@ -33,6 +33,11 @@ class Member(models.Model):
             # Building an audience: "active members of this local (and classification)".
             models.Index(fields=["local", "status", "classification"]),
         ]
+        constraints = [
+            # Target for composite FKs (account, recipient) that pin a row to the member's
+            # own local. The FKs themselves are raw SQL in migrations; Django can't express them.
+            models.UniqueConstraint(fields=["id", "local"], name="member_id_local_uniq"),
+        ]
 
     def __str__(self):
         return self.full_name
@@ -62,8 +67,9 @@ class Account(models.Model):
         ]
 
     def clean(self):
-        # A login must never point at another local's member.
-        # (A CHECK can't compare across tables, so this lives in Python.)
+        # A login must never point at another local's member. Postgres guarantees this with
+        # the composite FK (member_id, local_id) -> member (id, local_id), added in
+        # core/migrations/0002; this check only turns it into a friendly error message.
         if self.member_id and self.member.local_id != self.local_id:
             raise ValidationError("Account local must match its member's local.")
 

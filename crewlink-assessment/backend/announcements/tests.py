@@ -39,6 +39,30 @@ class RecipientUniquenessTests(TestCase):
         self.assertEqual(ann.recipients.count(), 1)
 
 
+class RecipientSameLocalTests(TestCase):
+    """Composite FKs: a recipient row's local must match its announcement's and member's."""
+
+    def test_row_scoped_to_another_local_is_refused(self):
+        _, member, _, ann = make_world()
+        other = Local.objects.create(name="Local Other")
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            AnnouncementRecipient.objects.create(announcement=ann, member=member, local=other)
+
+    def test_member_from_another_local_is_refused(self):
+        local, _, _, ann = make_world()
+        other = Local.objects.create(name="Local Other")
+        outsider = Member.objects.create(local=other, full_name="X", email="x@x.example",
+                                         classification="Foreman")
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            AnnouncementRecipient.objects.create(announcement=ann, member=outsider, local=local)
+
+    def test_deleting_announcement_still_cascades_to_recipients(self):
+        local, member, _, ann = make_world()
+        AnnouncementRecipient.objects.create(announcement=ann, member=member, local=local)
+        ann.delete()
+        self.assertEqual(AnnouncementRecipient.objects.count(), 0)
+
+
 class AnnouncementConstraintTests(TestCase):
     def test_cannot_leave_draft_without_a_named_approver(self):
         # Even a buggy code path can't mark AI text as sendable without a human.

@@ -14,6 +14,10 @@ services:
 
   redis:
     image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 30
 
   # One-shot job: migrate + seed, then exit. Runs once, so two API instances
   # (added later) never race each other running migrations.
@@ -30,7 +34,27 @@ services:
     ports: ["8000:8000"]
     depends_on:
       setup: {condition: service_completed_successfully}
-      redis: {condition: service_started}
+      redis: {condition: service_healthy}
+
+  # Fan-out + dispatch jobs. Scale freely: claims use row locks (SKIP LOCKED),
+  # so extra workers share the work and never push the same member twice.
+  worker:
+    build: ./backend
+    command: celery -A config worker --loglevel=info --concurrency=4
+    env_file: .env.docker
+    depends_on:
+      setup: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+
+  # Runs the sweeper every minute. Keep exactly ONE beat: two would just sweep
+  # twice (harmless, since the sweeper is idempotent, but wasteful).
+  beat:
+    build: ./backend
+    command: celery -A config beat --loglevel=info --schedule /tmp/celerybeat-schedule
+    env_file: .env.docker
+    depends_on:
+      setup: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
 
 volumes:
   pgdata:

@@ -29,6 +29,7 @@ class Announcement(models.Model):
     audience_classification = models.CharField(max_length=100, blank=True, default="")  # "" = whole local
 
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.DRAFT)
+    version = models.PositiveIntegerField(default=1)  # goes up on every edit; approve must name it
     ai_generated = models.BooleanField(default=False)
     created_by = models.ForeignKey(Account, on_delete=models.PROTECT, related_name="+")
     approved_by = models.ForeignKey(Account, null=True, blank=True,
@@ -55,6 +56,8 @@ class Announcement(models.Model):
                 condition=~models.Q(push_preview=""),
                 name="push_preview_not_empty",
             ),
+            # Target for the recipient composite FK (announcement_id, local_id).
+            models.UniqueConstraint(fields=["id", "local"], name="announcement_id_local_uniq"),
         ]
         indexes = [models.Index(fields=["local", "-created_at"])]
 
@@ -101,6 +104,8 @@ class AnnouncementRecipient(models.Model):
             # The foundation of Rule 2: Postgres refuses a second row for the same member.
             models.UniqueConstraint(fields=["announcement", "member"],
                                     name="one_recipient_row_per_member"),
+            # Plus two composite FKs (raw SQL, announcements/migrations/0002): the row's
+            # local must equal both its announcement's local and its member's local.
         ]
         indexes = [
             models.Index(fields=["announcement", "push_status"]),  # worker claims, counts
@@ -116,7 +121,7 @@ class PushLog(models.Model):
     announcement = models.ForeignKey(Announcement, on_delete=models.CASCADE, related_name="+")
     member = models.ForeignKey(Member, on_delete=models.PROTECT, related_name="+")
     attempted_at = models.DateTimeField(auto_now_add=True)
-    ok = models.BooleanField()
+    ok = models.BooleanField(null=True)  # None = handed to provider, outcome unknown (intent log)
     detail = models.CharField(max_length=200, blank=True, default="")
 
     class Meta:
