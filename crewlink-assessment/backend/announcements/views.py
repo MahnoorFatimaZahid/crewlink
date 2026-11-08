@@ -9,14 +9,21 @@ from rest_framework.decorators import action
 # ValidationError -> 500 on Postgres; SQLite never validates, so it hid this bug).
 from rest_framework.generics import get_object_or_404
 from rest_framework.response import Response
+from rest_framework.throttling import UserRateThrottle
 
 from core.scoping import LocalScopedMixin
 
-from . import sending, tasks
+from . import ai, sending, tasks
 from .models import Announcement, AnnouncementRecipient
-from .serializers import AnnouncementSerializer, InboxItemSerializer
+from .serializers import AnnouncementSerializer, DraftFromNoteSerializer, InboxItemSerializer
 
 EDITABLE = (Announcement.Status.DRAFT, Announcement.Status.APPROVED)
+
+
+class AIDraftThrottle(UserRateThrottle):
+    """Per-leader limit on AI calls (they cost money). Counted in the default cache,
+    which is Redis, so the limit holds across both API instances."""
+    scope = "ai_draft"
 
 
 class AnnouncementViewSet(LocalScopedMixin,
@@ -77,6 +84,43 @@ class AnnouncementViewSet(LocalScopedMixin,
                 return Response({"detail": f"Can't approve an announcement that is {obj.status}."},
                                 status=status.HTTP_409_CONFLICT)
         return Response(self.get_serializer(obj).data)
+
+    @action(detail=False, methods=["post"], url_path="draft-from-note",
+            throttle_classes=[AIDraftThrottle])
+    def draft_from_note(self, request):
+        """Messy note -> AI title/body/preview, saved as a DRAFT only.
+
+        Throttled per leader, in the shared Redis cache (holds across instances).
+        If the provider fails, returns 503 and saves nothing: the leader writes it
+        by hand with the normal create endpoint.
+        """
+        incoming = DraftFromNoteSerializer(data=request.data)
+        incoming.is_valid(raise_exception=True)
+        options = dict(incoming.validated_data)
+        note = options.pop("note")
+
+        # Check the leader's own choices BEFORE paying for an AI call: a typo in the
+        # audience, or a meeting time in the past, should fail fast and free.
+        self.get_serializer(data={"title": "-", "body": "-", "push_preview": "-", **options}) \
+            .is_valid(raise_exception=True)
+
+        drafter = ai.get_drafter()
+        try:
+            text = drafter.draft(note)  # only the note goes to the provider
+        except ai.AIUnavailable:
+            return Response(
+                {"detail": "The AI helper is unavailable right now. Please write the announcement yourself.",
+                 "code": "ai_unavailable"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        # Same serializer and validation as a hand-written draft (audience must match
+        # someone, meeting time in the future...). local and author come from the account.
+        serializer = self.get_serializer(data={**text, **options})
+        serializer.is_valid(raise_exception=True)
+        serializer.save(local_id=self.account.local_id, created_by=self.account,
+                        ai_generated=True)  # status stays `draft`: a human must approve
+        return Response({**serializer.data, "ai_provider": drafter.name},
+                        status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["post"])
     def send(self, request, pk=None):

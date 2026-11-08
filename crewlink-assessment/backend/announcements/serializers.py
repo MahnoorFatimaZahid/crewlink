@@ -85,3 +85,12 @@ class InboxItemSerializer(LocalTripwireMixin, serializers.ModelSerializer):
         # Drives "this meeting has already happened" in the member app.
         event_at = row.announcement.event_at
         return event_at is not None and event_at <= timezone.now()
+
+
+class DraftFromNoteSerializer(serializers.Serializer):
+    """Only `note` goes to the provider; the rest are the leader's own choices."""
+    note = serializers.CharField(max_length=2000, trim_whitespace=True)
+    kind = serializers.ChoiceField(choices=Announcement.Kind.choices, required=False)
+    event_at = serializers.DateTimeField(required=False, allow_null=True)
+    needs_ack = serializers.BooleanField(required=False)
+    audience_classification = serializers.CharField(required=False, allow_blank=True, max_length=100)

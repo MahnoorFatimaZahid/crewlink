@@ -86,6 +86,12 @@ CELERY_TASK_IGNORE_RESULT = True
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 CELERY_BEAT_SCHEDULE = {"sweeper": {"task": "announcements.tasks.sweep_task", "schedule": 60.0}}
 
+# AI drafting (Stage 7). No key -> the fake provider, so reviewers can run the flow.
+# Set the key only in your shell, never in a committed file.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+AI_TIMEOUT_SECONDS = float(os.environ.get("AI_TIMEOUT_SECONDS", "10"))
+
 # Simulated push provider: fail some pushes / slow it down, to watch retries work.
 PUSH_FAIL_RATE = float(os.environ.get("PUSH_FAIL_RATE", "0"))
 PUSH_DELAY_MS = int(os.environ.get("PUSH_DELAY_MS", "0"))
@@ -111,5 +117,5 @@ REST_FRAMEWORK = {
     # A view is reachable only if it explicitly declares who may use it.
     "DEFAULT_PERMISSION_CLASSES": ["core.permissions.DenyAll"],
     # Counted in the shared Redis cache, so the limit holds across instances.
-    "DEFAULT_THROTTLE_RATES": {"login": "10/min"},
+    "DEFAULT_THROTTLE_RATES": {"login": "10/min", "ai_draft": "20/min"},
 }
