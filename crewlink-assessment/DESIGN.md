@@ -47,6 +47,7 @@ When leadership sends a callout, every active member of that local (or just one 
 - `status`: `draft → approved → queued → sending → sent`. Rule 2's send guard is a conditional change on this field.
 - `kind` (`general` | `meeting`), `event_at` (meeting time, used for expiry), `audience_classification` (optional filter)
 - `push_preview` (≤120 chars, DB check), `created_by`, `approved_by`, `approved_at` (no approval, no send), `supersedes_id` (a correction links to the original)
+- `version`: bumped by every edit, and any edit clears approval. Approve must name the version the leader reviewed (else 409), so nobody approves text they never saw.
 
 **`announcement_recipients`**: one row per member per callout. This is both the audience snapshot and the delivery record.
 - `announcement_id`, `member_id`: **unique together** (the foundation of Rule 2)
@@ -66,39 +67,40 @@ When leadership sends a callout, every active member of that local (or just one 
 3. Queue the fan-out job with `transaction.on_commit`, so the worker never runs before the status change is saved. Return **202 Accepted**; the screen switches to live counts.
 
 **Elsewhere (Celery workers):**
-4. **Fan-out:** one `INSERT … SELECT` of active members in the local (plus classification), `ON CONFLICT (announcement_id, member_id) DO NOTHING`. Status becomes `sending`. The work is split into batches of 500 (~45 for 22,400).
+4. **Fan-out:** one `INSERT … SELECT` of active members in the local (plus classification), `ON CONFLICT (announcement_id, member_id) DO NOTHING`. It runs only while `queued`, and the insert and the switch to `sending` share one transaction, so a re-run can't add members who joined after Send. Dispatch works in batches of 500.
 5. **Dispatch:** each job claims rows with `UPDATE … SET push_status='sending' WHERE id IN (SELECT … WHERE push_status='pending' LIMIT 500 FOR UPDATE SKIP LOCKED)`, so parallel workers, even on different instances, never get the same row.
-6. Past `event_at`, the row is marked `skipped` and nothing is pushed. Otherwise the push goes out and the row becomes `sent` (accepted by the provider; the phone may still be offline). Failures retry with backoff (3 tries), then `failed`; the message is still in the inbox.
+6. Past `event_at`, or if the member was suspended after Send, the row is marked `skipped` and nothing is pushed. Otherwise the push goes out and the row becomes `sent` (accepted by the provider; the phone may still be offline). Failures retry after 30 s (3 tries), then `failed`; the message is still in the inbox.
 7. When nothing is `pending` or `sending`, the announcement is `sent`. With 4 workers, the largest local finishes in under 2 minutes.
 
-**Members** fetch `GET /me/announcements` whenever the app opens or reconnects, so offline members get everything they missed. Push is only a nudge.
+**Members** sync `GET /me/announcements` on app open and reconnect, so offline members miss nothing; push is only a nudge.
 
-**If Redis loses jobs:** Redis holds jobs in memory, so a crash or restart can lose them. That's safe because jobs are only messengers; the work still to do is written in Postgres. A sweeper (Celery beat, every minute) reads Postgres and re-queues whatever has stalled: announcements still `queued` after a minute (fan-out job lost), announcements `sending` with `pending` rows untouched for 2 minutes (dispatch jobs lost), and rows stuck in `sending` for over 5 minutes (worker died mid-batch, reset to `pending`). Workers also use `acks_late`, so a job a worker crashed on returns to the queue. Re-queuing a job that wasn't really lost is harmless, because every step is idempotent.
+**If Redis loses jobs:** a crash or restart can lose them, which is safe because jobs are only messengers; the work still to do is in Postgres. A sweeper (Celery beat, every minute) re-queues stalled work: announcements `queued` over a minute (fan-out lost), `sending` with `pending` rows untouched for 2 minutes (dispatch lost), and rows in `sending` over 5 minutes (worker died; reset to `pending`). Workers use `acks_late`, so a crashed job returns to the queue. Re-queuing a job that wasn't really lost is harmless, because every step is idempotent. Without Redis at all, `manage.py process_sends` polls Postgres and runs the same steps: Redis adds speed, not correctness.
 
 **Live counts without hammering the DB:** the screen polls `GET /announcements/{id}/stats` every 3 s. The server serves it from Redis (2 s expiry); on a miss it runs one `COUNT(*) FILTER (…)` query on the indexed recipient rows. Any number of viewers means at most one query per 2 s per announcement.
-- *Rejected:* counter columns incremented per push (22,400 updates fighting for one row's lock); WebSockets/SSE (nicer, but more infrastructure than a 3 s delay justifies; a later upgrade).
+- *Rejected:* per-push counter columns (22,400 updates fighting over one row lock); WebSockets/SSE (more infrastructure than a 3 s delay justifies).
 
 ### 3. The two rules, by design
 
 **Rule 1: two boundaries, enforced in one place**
 - **Identity comes from the server.** The login token loads the user's `account` (`local_id`, `role`). A `local_id` in the URL or body is ignored, and new records take `local_id` from the caller's account.
-- **Between locals:** every view inherits `LocalScopedViewSet`, whose `get_queryset` filters by the caller's `local_id`. Another local's record is simply not found, so the response is **404**, which doesn't confirm it exists.
+- **Between locals:** every view inherits `LocalScopedMixin`, whose `get_queryset` filters by the caller's `local_id`. Another local's record is simply not found, so the response is **404**, which doesn't confirm it exists.
 - **Member vs leader:** each view declares `allowed_roles`. Members also only see their own recipient rows. A member calling a leader endpoint gets **403** (nothing new is revealed inside their own local).
 - **Responses:** serializers never return other members' contact details.
 - **The endpoint added next year:** the default permission denies everyone unless a view declares `allowed_roles`, so a forgotten role setting fails closed at runtime. A guard test walks every URL and fails the build if a view doesn't inherit the scoped base (or isn't on a short reviewed allow-list, such as login). This catches a forgotten local filter that the role check alone would miss.
-- **Known limit:** a raw unscoped query written inside a scoped view gets past both. Hardening next step: Postgres Row-Level Security keyed on the request's `local_id`.
+- **Known limit:** a raw unscoped query inside a scoped view gets past both. Next: Postgres Row-Level Security keyed on `local_id`.
 
 **Rule 2: one guard at each moment a duplicate could appear, all in Postgres**
 - **Send pressed twice** (double click, retry, two leaders): the atomic `approved → queued` update succeeds once; later attempts change 0 rows and get the same 202.
 - **Fan-out restarts:** `UNIQUE (announcement_id, member_id)` with `ON CONFLICT DO NOTHING`; re-running inserts only missing rows.
 - **Dispatch in parallel or restarted:** rows are claimed with `FOR UPDATE SKIP LOCKED` and only `pending` rows are pushed. The lock plus the status check gives correctness; `SKIP LOCKED` gives parallel speed.
-- **Why not in memory:** a "sent" set inside one process is wiped by a restart and invisible to a second instance. Postgres is the one place every process and instance shares.
-- **The gap we can't close:** a crash between "push accepted" and "saved as sent" leaves the row in `sending`; the sweeper resets it and it is pushed again. Pushing and writing to the DB can't be one atomic step, so delivery is at-least-once, and we make repeats harmless on the device: each push carries the **announcement id** as its Android notification `tag` and iOS `apns-collapse-id`, so a repeat of the same callout replaces the notification already shown, while different callouts have different ids and never replace each other. The inbox is also keyed by announcement id. We deliberately don't rely on FCM's `collapse_key`: notification messages ignore it, and while a phone is offline FCM may collapse or drop older notifications, which is why the app always does a full inbox sync on reconnect.
+- **Why not in memory:** a "sent" set in one process dies with a restart and is invisible to a second instance. Postgres is shared by all.
+- **The gap we can't close:** a crash between "push accepted" and "saved as sent" leaves the row in `sending`; the sweeper resets it and it is pushed again. Pushing and writing to the DB can't be one atomic step, so delivery is at-least-once, and we make repeats harmless on the device: each push carries the **announcement id** as its Android notification `tag` and iOS `apns-collapse-id`, so a repeat of the same callout replaces the notification already shown, while different callouts never replace each other. The inbox is also keyed by announcement id. (Not FCM's `collapse_key`: notification messages ignore it.)
 
 **Finding out in production that a rule already broke:** each rule is written as an invariant (a query that must return zero rows), checked live and on a schedule.
 - **Rule 1 tripwire:** the base serializer checks every object's `local_id` against the caller's before a response leaves; a mismatch is blocked, logged and alerted. This catches the raw-query case prevention misses.
-- **Rule 1 audits:** nightly queries for recipient rows whose `local_id` differs from their announcement's, and member accounts linked to another local's member. An audit log of every request (account, local, role, endpoint, result) feeds alerts on many 404/403s from one account (id probing) or members calling leader endpoints.
-- **Rule 2:** every push attempt is written to `push_log`. Alert when pushes ÷ recipients for an announcement exceeds 1.0, or any recipient has more than one push. Track sweeper resets (each is a possible duplicate), and have the app report duplicates it dropped.
+- **Rule 1 audits:** queries for recipient rows whose `local_id` differs from their announcement's or member's, and member accounts linked to another local's member. Next: a per-request audit log, alerting on many 404/403s from one account (id probing).
+- **Rule 2:** an intent row goes into `push_log` *before* each push (`ok = NULL`, outcome unknown) and is completed after, so a crash mid-push still records who may have been pushed. (A `kill -9` test showed logging only after the batch recorded nothing.) Alert when any recipient has more than one possible push; sweeper resets are logged as possible duplicates.
+- **Built:** `manage.py check_integrity` runs these invariants and exits 1 on any failure, ready for a nightly job.
 - **If one fires:** contain first, measure exposure both ways (who saw what), find the cause in the audit log, inform both locals' leadership, then fix with a test that reproduces it.
 
 ### 4. Diagram
@@ -148,3 +150,18 @@ flowchart LR
 ```
 
 API instances keep no state of their own, so nginx can send any request to either one. Everything that must survive a restart or be shared lives in Postgres; Redis can lose jobs and the sweeper rebuilds them from Postgres.
+
+---
+
+## What I cut
+
+Designed above, not built in this submission:
+
+- **RSVP endpoints** ("coming / can't come"). The fields exist on `announcement_recipients` and the status screen counts them, but members have no endpoint to set them yet.
+- **A member-facing screen.** Members use the API (`/api/me/announcements`, read, ack); the brief's frontend is the leadership screen.
+- **Real push (FCM/APNs)** and the **SMS follow-up** for unacknowledged urgent callouts. Push goes through a logging provider with an optional simulated failure rate.
+- **A "who hasn't seen it" member list** on the status screen. Only the counts are built.
+- **Postgres Row-Level Security** as a third Rule 1 layer, and the **per-request audit log**.
+- **`httpOnly` cookie auth.** The leadership screen keeps its token in `sessionStorage`, which is simpler but readable by any injected script.
+- **A circuit breaker for Gemini.** Each call has a hard 10 s timeout and no retries, but repeated failures aren't short-circuited.
+- **Server-Sent Events** for live counts. The screen polls every 3 s (10 s once sent) against a 2 s cache.
