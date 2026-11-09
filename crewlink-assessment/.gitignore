@@ -1,6 +1,28 @@
+# Python
 __pycache__/
 *.pyc
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets: real keys go in .env (never committed).
+# .env.docker IS committed on purpose: dev-only values reviewers need for docker compose.
 .env
+.env.local
+.env.*.local
+
+# Celery / logs
+celerybeat-schedule*
+*.log
+
+# Frontend (Next.js)
 node_modules/
 .next/
-.venv/
+out/
+
+# Editors / OS
+.idea/
+.DS_Store
+Thumbs.db
