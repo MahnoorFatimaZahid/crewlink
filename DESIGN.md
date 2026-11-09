@@ -41,7 +41,7 @@ When leadership sends a callout, every active member of that local (or just one 
 
 **`accounts`**: who can log in, and with what powers
 - `user_id` (1:1 with the Django user), `local_id`, `role` (`leader` | `member`), `member_id` (required when role is member; enforced by a DB check)
-- *Rejected:* a `role` column on `members` (not every leader is a member, and it mixes login with union membership). Django Groups (no notion of a local, so the local check would live somewhere else).
+- *Rejected:* a `role` column on `members` (not every leader is a member; mixes login with membership) and Django Groups (no notion of a local).
 
 **`announcements`**: the brief's fields, plus
 - `status`: `draft → approved → queued → sending → sent`. Rule 2's send guard is a conditional change on this field.
@@ -57,24 +57,24 @@ When leadership sends a callout, every active member of that local (or just one 
 
 **Why timestamps, not one status field:** they keep *when* things happened, so "hasn't seen it" (`read_at` empty) and "seen, no reply" (`read_at` set, `rsvp` empty) fall straight out of the data. Acking sets `read_at` if it's empty. A repeat ack keeps the first time. RSVP can change until `event_at`. A read after expiry is still recorded.
 
-**Cross-local guarantee (built):** composite foreign keys make Postgres itself refuse a recipient row whose local differs from its announcement's `(announcement_id, local_id)` or its member's `(member_id, local_id)`, and an account whose `(member_id, local_id)` points at another local's member. They're raw SQL in migrations because Django can't express composite FKs; `Account.clean()` stays only for a friendly error message.
+**Cross-local guarantee (built):** composite foreign keys make Postgres itself refuse a recipient row whose local differs from its announcement's `(announcement_id, local_id)` or its member's `(member_id, local_id)`, and an account whose `(member_id, local_id)` points at another local's member. They're raw SQL in migrations, since Django can't express composite FKs.
 
 ### 2. The send path
 
 **Inside the request (leader waits ~100 ms):**
 1. Check the caller is a leader of this announcement's local (otherwise 404), and that the announcement is approved.
-2. One atomic update: `UPDATE announcements SET status='queued', sent_at=now() WHERE id=? AND status='approved'`. One row changed means a first send. Zero rows means a retry or a double click, so we return the same 202 and do no new work (or 409 if it was never approved). Doing the check and the change in one statement avoids a check-then-act race between two leaders clicking at once.
+2. One atomic update: `UPDATE announcements SET status='queued', sent_at=now() WHERE id=? AND status='approved'`. One row changed: a first send. Zero: a retry or double click, so the same 202 and no new work (409 if never approved). One statement, so two leaders clicking at once can't race.
 3. Queue the fan-out job with `transaction.on_commit`, so the worker never runs before the status change is saved. Return **202 Accepted**; the screen switches to live counts.
 
 **Elsewhere (Celery workers):**
 4. **Fan-out:** one `INSERT … SELECT` of active members in the local (plus classification), `ON CONFLICT (announcement_id, member_id) DO NOTHING`. It runs only while `queued`, and the insert and the switch to `sending` share one transaction, so a re-run can't add members who joined after Send. Dispatch works in batches of 500.
 5. **Dispatch:** each job claims rows with `UPDATE … SET push_status='sending' WHERE id IN (SELECT … WHERE push_status='pending' LIMIT 500 FOR UPDATE SKIP LOCKED)`, so parallel workers, even on different instances, never get the same row.
-6. Past `event_at`, or if the member was suspended after Send, the row is marked `skipped` and nothing is pushed. Otherwise the push goes out and the row becomes `sent` (accepted by the provider; the phone may still be offline). Failures retry after 30 s (3 tries), then `failed`; the message is still in the inbox.
+6. Past `event_at`, or if the member was suspended after Send, the row is marked `skipped` and nothing is pushed. Otherwise it's pushed and marked `sent` (provider accepted; the phone may be offline). Failures retry after 30 s (3 tries), then `failed`; the message is still in the inbox.
 7. When nothing is `pending` or `sending`, the announcement is `sent`. With 4 workers, the largest local finishes in under 2 minutes.
 
 **Members** sync `GET /me/announcements` on app open and reconnect, so offline members miss nothing; push is only a nudge.
 
-**If Redis loses jobs:** a crash or restart can lose them, which is safe because jobs are only messengers; the work still to do is in Postgres. A sweeper (Celery beat, every minute) re-queues stalled work: announcements `queued` over a minute (fan-out lost), `sending` with `pending` rows untouched for 2 minutes (dispatch lost), and rows in `sending` over 5 minutes (worker died; reset to `pending`). Workers use `acks_late`, so a crashed job returns to the queue. Re-queuing a job that wasn't really lost is harmless, because every step is idempotent. Without Redis at all, `manage.py process_sends` polls Postgres and runs the same steps: Redis adds speed, not correctness.
+**If Redis loses jobs** (crash or restart), that's safe: jobs are only messengers, and the remaining work is in Postgres. A sweeper (Celery beat, every minute) re-queues stalled work: announcements `queued` over a minute (fan-out lost), `sending` with `pending` rows untouched for 2 minutes (dispatch lost), and rows in `sending` over 5 minutes (worker died; reset to `pending`). Workers use `acks_late`, so a crashed job returns to the queue. Re-queuing is harmless: every step is idempotent. Without Redis at all, `manage.py process_sends` polls Postgres and runs the same steps: Redis adds speed, not correctness.
 
 **Live counts without hammering the DB:** the screen polls `GET /announcements/{id}/stats` every 3 s. The server serves it from Redis (2 s expiry); on a miss it runs one `COUNT(*) FILTER (…)` query on the indexed recipient rows. Any number of viewers means at most one query per 2 s per announcement.
 - *Rejected:* per-push counter columns (22,400 updates fighting over one row lock); WebSockets/SSE (more infrastructure than a 3 s delay justifies).
@@ -94,62 +94,20 @@ When leadership sends a callout, every active member of that local (or just one 
 - **Fan-out restarts:** `UNIQUE (announcement_id, member_id)` with `ON CONFLICT DO NOTHING`; re-running inserts only missing rows.
 - **Dispatch in parallel or restarted:** rows are claimed with `FOR UPDATE SKIP LOCKED` and only `pending` rows are pushed. The lock plus the status check gives correctness; `SKIP LOCKED` gives parallel speed.
 - **Why not in memory:** a "sent" set in one process dies with a restart and is invisible to a second instance. Postgres is shared by all.
-- **The gap we can't close:** a crash between "push accepted" and "saved as sent" leaves the row in `sending`; the sweeper resets it and it is pushed again. Pushing and writing to the DB can't be one atomic step, so delivery is at-least-once, and we make repeats harmless on the device: each push carries the **announcement id** as its Android notification `tag` and iOS `apns-collapse-id`, so a repeat of the same callout replaces the notification already shown, while different callouts never replace each other. The inbox is also keyed by announcement id. (Not FCM's `collapse_key`: notification messages ignore it.)
+- **The gap we can't close:** a crash between "push accepted" and "saved as sent" leaves the row in `sending`; the sweeper resets it and it is pushed again. Push and DB write can't be atomic, so delivery is at-least-once; repeats are made harmless on the device: each push carries the **announcement id** as its Android notification `tag` and iOS `apns-collapse-id`, so a repeat of the same callout replaces the notification already shown, while different callouts never replace each other. The inbox is also keyed by announcement id. (Not FCM's `collapse_key`: notification messages ignore it.)
 
 **Finding out in production that a rule already broke:** each rule is written as an invariant (a query that must return zero rows), checked live and on a schedule.
 - **Rule 1 tripwire:** the base serializer checks every object's `local_id` against the caller's before a response leaves; a mismatch is blocked, logged and alerted. This catches the raw-query case prevention misses.
 - **Rule 1 audits:** queries for recipient rows whose `local_id` differs from their announcement's or member's, and member accounts linked to another local's member. Next: a per-request audit log, alerting on many 404/403s from one account (id probing).
-- **Rule 2:** an intent row goes into `push_log` *before* each push (`ok = NULL`, outcome unknown) and is completed after, so a crash mid-push still records who may have been pushed. (A `kill -9` test showed logging only after the batch recorded nothing.) Alert when any recipient has more than one possible push; sweeper resets are logged as possible duplicates.
+- **Rule 2:** an intent row goes into `push_log` *before* each push (`ok = NULL`, outcome unknown) and is completed after, so a crash mid-push still records who may have been pushed. (A `kill -9` test showed post-batch logging recorded nothing.) Alert when any recipient has more than one possible push; sweeper resets are logged as possible duplicates.
 - **Built:** `manage.py check_integrity` runs these invariants and exits 1 on any failure, ready for a nightly job.
 - **If one fires:** contain first, measure exposure both ways (who saw what), find the cause in the audit log, inform both locals' leadership, then fix with a test that reproduces it.
 
 ### 4. Diagram
 
-```mermaid
-flowchart LR
-  L["Leadership screen<br/>(Next.js)"]
-  M["Member app<br/>(inbox, read, ack)"]
-  LB["nginx load balancer<br/>(round-robin)"]
+See [diagram.md](diagram.md).
 
-  subgraph API["Django + DRF: 2 identical, stateless instances"]
-    direction TB
-    AUTH["1. Authenticate<br/>token → account<br/>(local_id, role)"]
-    PERM["2. Role check<br/>allowed_roles, deny by default"]
-    VIEW["3. View<br/>queries scoped to caller's local"]
-    TRIP["4. Response tripwire<br/>every object's local_id = caller's"]
-    AUTH --> PERM --> VIEW --> TRIP
-  end
-
-  PG[("Postgres<br/>source of truth<br/>status, recipients,<br/>unique key, row locks,<br/>push_log")]
-  R[("Redis<br/>job queue (can lose jobs)<br/>+ 2 s count cache")]
-
-  subgraph CEL["Celery workers"]
-    FO["Fan-out<br/>(creates recipient rows)"]
-    DW["Dispatch<br/>(claims rows, SKIP LOCKED)"]
-    SW["Sweeper, every minute<br/>(rebuilds lost jobs<br/>from Postgres state)"]
-  end
-
-  P["Push provider<br/>(FCM; logged in this build)"]
-  G["Gemini<br/>(draft only, needs approval)"]
-
-  L -->|"HTTPS + token"| LB
-  M -->|"HTTPS + token"| LB
-  LB -->|"instance 1 or 2"| AUTH
-  VIEW -->|"reads/writes"| PG
-  VIEW -->|"queue jobs, cached counts"| R
-  VIEW -.->|"draft request, 10 s timeout"| G
-  R -->|"jobs"| FO
-  R -->|"jobs"| DW
-  FO -->|"INSERT ON CONFLICT DO NOTHING"| PG
-  DW -->|"claim, mark sent"| PG
-  DW -->|"push, tag = announcement id"| P
-  P -.->|"maybe buzzes:<br/>accepted ≠ received ≠ read"| M
-  M -->|"inbox sync on open/reconnect<br/>sets received_at, read_at, acked_at"| LB
-  SW -->|"find stalled work"| PG
-  SW -->|"re-queue"| R
-```
-
-API instances keep no state of their own, so nginx can send any request to either one. Everything that must survive a restart or be shared lives in Postgres; Redis can lose jobs and the sweeper rebuilds them from Postgres.
+API instances keep no state, so nginx can send any request to either. Shared and durable state lives in Postgres; the sweeper rebuilds lost Redis jobs from it.
 
 ---
 
