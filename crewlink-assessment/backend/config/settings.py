@@ -118,4 +118,8 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": ["core.permissions.DenyAll"],
     # Counted in the shared Redis cache, so the limit holds across instances.
     "DEFAULT_THROTTLE_RATES": {"login": "10/min", "ai_draft": "20/min"},
+    # How many proxies sit in front of Django: 1 behind nginx (set in docker-compose),
+    # 0 locally. Never leave it unset: DRF would then trust the client-sent
+    # X-Forwarded-For, and a fake value per attempt would dodge the login rate limit.
+    "NUM_PROXIES": int(os.environ.get("NUM_PROXIES", "0")),
 }

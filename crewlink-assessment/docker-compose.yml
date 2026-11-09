@@ -1,5 +1,30 @@
-# docker compose up --build   ->  leadership screen on http://localhost:3000
-#                                 API on http://localhost:8000
+# docker compose up --build
+#   http://localhost:8000        leadership screen (Next.js)
+#   http://localhost:8000/api/   API (round-robin across api1 + api2)
+# nginx is the only published entry point.
+
+# Shared by every Django service. .env is optional and git-ignored (GEMINI_API_KEY).
+x-django-env: &django-env
+  env_file:
+    - .env.docker
+    - {path: .env, required: false}
+
+# api1 and api2 are identical: same image, same settings. They keep no state of
+# their own (it's all in Postgres + Redis), so nginx can send any request to either.
+x-api: &api
+  build: ./backend
+  <<: *django-env
+  environment:
+    NUM_PROXIES: "1"   # nginx sits in front and overwrites X-Forwarded-For
+  depends_on:
+    setup: {condition: service_completed_successfully}
+    redis: {condition: service_healthy}
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/')"]
+    interval: 5s
+    timeout: 3s
+    retries: 20
+
 services:
   db:
     image: postgres:16
@@ -20,56 +45,57 @@ services:
       interval: 2s
       retries: 30
 
-  # One-shot job: migrate + seed, then exit. Runs once, so two API instances
-  # (added later) never race each other running migrations.
+  # One-shot job: migrate + seed, then exit. Runs once, so the two API instances
+  # never race each other running migrations.
   setup:
     build: ./backend
+    <<: *django-env
     command: sh -c "python manage.py migrate && python manage.py seed"
-    env_file: .env.docker
     depends_on:
       db: {condition: service_healthy}
 
-  api:
-    build: ./backend
-    # .env is optional and git-ignored: put GEMINI_API_KEY there to use real Gemini.
-    # Without it, the API uses the fake AI provider.
-    env_file:
-      - .env.docker
-      - {path: .env, required: false}
+  api1: *api
+  api2: *api
+
+  # The front door: /api/ and /health/ -> api1/api2 (round-robin), / -> Next.js.
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     ports: ["8000:8000"]
     depends_on:
-      setup: {condition: service_completed_successfully}
-      redis: {condition: service_healthy}
+      api1: {condition: service_healthy}
+      api2: {condition: service_healthy}
+      web: {condition: service_started}
 
-  # Fan-out + dispatch jobs. Scale freely: claims use row locks (SKIP LOCKED),
-  # so extra workers share the work and never push the same member twice.
+  # Fan-out + dispatch jobs. Scale freely (docker compose up --scale worker=3):
+  # claims use row locks (SKIP LOCKED), so workers share rows and never push one twice.
   worker:
     build: ./backend
+    <<: *django-env
     command: celery -A config worker --loglevel=info --concurrency=4
-    env_file: .env.docker
     depends_on:
       setup: {condition: service_completed_successfully}
       redis: {condition: service_healthy}
 
-  # Runs the sweeper every minute. Keep exactly ONE beat: two would just sweep
-  # twice (harmless, since the sweeper is idempotent, but wasteful).
+  # Runs the sweeper every minute. Keep exactly ONE beat.
   beat:
     build: ./backend
+    <<: *django-env
     command: celery -A config beat --loglevel=info --schedule /tmp/celerybeat-schedule
-    env_file: .env.docker
     depends_on:
       setup: {condition: service_completed_successfully}
       redis: {condition: service_healthy}
 
-  # Leadership screen. The browser talks only to this server; /api/* is proxied
-  # to the api service inside the compose network (no CORS needed).
+  # Leadership screen. Not published: reached through nginx at http://localhost:8000.
+  # Browser API calls go to nginx directly (/api/ is routed before /), so API_URL
+  # (baked into the rewrites) is only a fallback; it points at nginx so it would still
+  # be load-balanced.
   web:
     build:
       context: ./frontend
-      args: {API_URL: "http://api:8000"}
-    ports: ["3000:3000"]
-    depends_on:
-      api: {condition: service_started}
+      args:
+        API_URL: "http://nginx:8000"
 
 volumes:
   pgdata:
